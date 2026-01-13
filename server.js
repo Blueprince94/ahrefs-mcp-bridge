@@ -83,71 +83,84 @@ app.get("/recommend-links", async (req, res) => {
   if (!requireProxyKey(req, res)) return;
 
   const target = req.query.target?.toString();
-  const mode = (req.query.mode?.toString() || "domain");
+  const mode = (req.query.mode?.toString() || "subdomains"); // default subdomains recommended by Ahrefs
 
   if (!target) {
     return res.status(400).json({ ok: false, error: "Missing required query param: target" });
   }
 
+  // YYYY-MM-DD (Ahrefs tools require date)
+  const today = new Date().toISOString().slice(0, 10);
+
   try {
     const result = await withAhrefsMcp(async (client) => {
-      const toolsResp = await client.listTools();
-      const tools = toolsResp?.tools || [];
+      const toolName = "site-explorer-metrics";
 
-      const tryCall = async (name, args) => {
+      // Try a few argument combos (Ahrefs MCP can be strict about optional params)
+      const attempts = [];
+
+      const tryCall = async (args) => {
         try {
-          const r = await client.callTool({ name, arguments: args });
-          return { ok: true, name, args, r };
+          const r = await client.callTool({ name: toolName, arguments: args });
+          return { ok: true, args, r };
         } catch (err) {
-          return { ok: false, name, args, err: String(err?.message || err) };
+          return { ok: false, args, err: String(err?.message || err) };
         }
       };
 
-      const attempts = [];
-      attempts.push(await tryCall("site_explorer_refdomains", { target, mode }));
-      attempts.push(await tryCall("site_explorer_refdomains", { target, mode, output: "json" }));
-      attempts.push(await tryCall("refdomains", { target, mode }));
-      attempts.push(await tryCall("referring_domains", { target, mode }));
-      attempts.push(await tryCall("site_explorer_overview", { target, mode }));
+      // Attempt 1: minimal required + mode
+      attempts.push(await tryCall({ target, date: today, mode }));
 
-      const success = attempts.find((a) => a.ok);
+      // Attempt 2: minimal required only
+      attempts.push(await tryCall({ target, date: today }));
 
+      const success = attempts.find(a => a.ok);
       if (!success) {
         return {
           ok: false,
-          error: "Could not call an Ahrefs MCP tool successfully (tool name/args mismatch).",
-          hint: "Open /debug-tools to see the exact tool names + required params, then we’ll map it to RD count.",
-          tools_available: tools.map((t) => ({ name: t.name, description: t.description })),
-          attempts,
+          error: "Could not call site-explorer-metrics successfully.",
+          called: toolName,
+          attempts
         };
       }
 
       const payload = success.r;
-      const textBlocks = payload?.content || [];
+      const blocks = payload?.content || [];
 
+      // Try to extract refdomains from any JSON text blocks
       let rd = null;
-      for (const b of textBlocks) {
+
+      for (const b of blocks) {
         if (b.type === "text" && typeof b.text === "string") {
+          // Try JSON parse
           try {
             const parsed = JSON.parse(b.text);
+
             rd =
               parsed?.refdomains ??
               parsed?.referring_domains ??
               parsed?.metrics?.refdomains ??
-              parsed?.summary?.refdomains ??
+              parsed?.metrics?.referring_domains ??
               parsed?.stats?.refdomains ??
+              parsed?.stats?.referring_domains ??
+              parsed?.data?.refdomains ??
+              parsed?.data?.referring_domains ??
               null;
+
             if (rd !== null && rd !== undefined) break;
-          } catch (_) {}
+          } catch (_) {
+            // ignore non-JSON blocks
+          }
         }
       }
 
+      // If still not found, return raw response so we can map the correct field name
       if (rd === null || rd === undefined || Number.isNaN(Number(rd))) {
         return {
           ok: false,
-          error: "Tool call succeeded but could not extract Referring Domains count from response.",
-          called_tool: { name: success.name, args: success.args },
-          raw_result: payload,
+          error: "Tool call succeeded but refdomains field not found in response.",
+          called_tool: { name: toolName, args: success.args },
+          raw_result: payload
         };
       }
 
@@ -158,10 +171,11 @@ app.get("/recommend-links", async (req, res) => {
         ok: true,
         target,
         mode,
+        date: today,
         referring_domains: rd,
         recommended_backlinks_min: rec.min,
         recommended_backlinks_max: rec.max,
-        rationale: rec.rationale,
+        rationale: rec.rationale
       };
     });
 
@@ -171,7 +185,7 @@ app.get("/recommend-links", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: "Unexpected server error",
-      message: String(e?.message || e),
+      message: String(e?.message || e)
     });
   }
 });
