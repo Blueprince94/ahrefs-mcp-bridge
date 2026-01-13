@@ -98,7 +98,7 @@ app.get("/recommend-links", async (req, res) => {
         arguments: {
           target,
           mode,
-          select: "refdomains"
+          select: "dofollow_refdomains"
         }
       });
 
@@ -110,9 +110,9 @@ app.get("/recommend-links", async (req, res) => {
           try {
             const parsed = JSON.parse(b.text);
             rd =
-              parsed?.refdomains ??
-              parsed?.metrics?.refdomains ??
-              parsed?.summary?.refdomains ??
+               parsed?.dofollow_refdomains ??
+               parsed?.metrics?.dofollow_refdomains ??
+  	       parsed?.summary?.dofollow_refdomains ??
               null;
             if (rd !== null) break;
           } catch {}
