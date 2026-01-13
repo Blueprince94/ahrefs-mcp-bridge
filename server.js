@@ -18,7 +18,7 @@ const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 
 // Ahrefs remote MCP endpoint (Ahrefs provides a remote MCP server).
 // One public reference shows:
-const AHREFS_MCP_URL = "https://api.ahrefs.com/mcp/mcp";
+const AHREFS_MCP_URL = "https://api.ahrefs.com/mcp/mcpSse";
 
 // --- Helpers ---
 function requireProxyKey(req, res) {
