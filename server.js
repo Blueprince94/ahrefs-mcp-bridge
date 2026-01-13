@@ -1,6 +1,6 @@
 import express from "express";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const app = express();
 app.use(express.json());
@@ -18,7 +18,7 @@ const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 
 // Ahrefs remote MCP endpoint (Ahrefs provides a remote MCP server).
 // One public reference shows:
-const AHREFS_MCP_URL = "https://api.ahrefs.com/mcp/mcpSse";
+const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
 
 // --- Helpers ---
 function requireProxyKey(req, res) {
@@ -48,7 +48,7 @@ async function withAhrefsMcp(fn) {
     "X-API-Key": AHREFS_MCP_KEY
   };
 
-  const transport = new SSEClientTransport(new URL(AHREFS_MCP_URL), { headers });
+  const transport = new StreamableHTTPClientTransport(new URL(AHREFS_MCP_URL), { headers });
   const client = new Client({ name: "t-ranks-ahrefs-mcp-bridge", version: "1.0.0" }, { capabilities: {} });
 
   await client.connect(transport);
