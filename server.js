@@ -11,6 +11,9 @@ const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 // Recommended Ahrefs MCP endpoint
 const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
 
+// bump this whenever you redeploy so you can confirm Railway is running the new build
+const BUILD_VERSION = "2026-01-14-01";
+
 // --- Helpers ---
 function requireProxyKey(req, res) {
   const provided = req.header("X-TRANKS-PROXY-KEY");
@@ -32,6 +35,7 @@ function recommendLinksFromRD(rd) {
 async function withAhrefsMcp(fn) {
   if (!AHREFS_MCP_KEY) throw new Error("Missing AHREFS_MCP_KEY env var.");
 
+  // keep all three header styles (Ahrefs MCP has been picky depending on tool/client)
   const headers = {
     Authorization: `Bearer ${AHREFS_MCP_KEY}`,
     "X-Api-Token": AHREFS_MCP_KEY,
@@ -58,7 +62,7 @@ async function withAhrefsMcp(fn) {
 
 // --- Routes ---
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "ahrefs-mcp-bridge" });
+  res.json({ ok: true, service: "ahrefs-mcp-bridge", version: BUILD_VERSION });
 });
 
 app.get("/debug-tools", async (req, res) => {
@@ -83,7 +87,7 @@ app.get("/recommend-links", async (req, res) => {
   if (!requireProxyKey(req, res)) return;
 
   const target = req.query.target?.toString();
-  const mode = (req.query.mode?.toString() || "subdomains");
+  const mode = (req.query.mode?.toString() || "subdomains"); // keep default subdomains
 
   if (!target) {
     return res.status(400).json({ ok: false, error: "Missing required query param: target" });
@@ -91,64 +95,89 @@ app.get("/recommend-links", async (req, res) => {
 
   try {
     const result = await withAhrefsMcp(async (client) => {
-
-      // Call the real referring domains tool
+      // IMPORTANT:
+      // This tool returns rows (often as { refdomains: [...] }) not a single number.
+      // We request limit=1 to make extraction deterministic.
       const r = await client.callTool({
         name: "site-explorer-referring-domains",
         arguments: {
           target,
           mode,
-          select: "dofollow_refdomains"
-        }
+          select: "dofollow_refdomains",
+          limit: 1,
+          // optional (uncomment if you want to filter obvious spam)
+          // where: "is_spam=0",
+          // order_by: "dofollow_refdomains:desc",
+        },
       });
 
       const blocks = r?.content || [];
       let rd = null;
 
       for (const b of blocks) {
-        if (b.type === "text") {
-          try {
-            const parsed = JSON.parse(b.text);
-            rd =
-               parsed?.dofollow_refdomains ??
-               parsed?.metrics?.dofollow_refdomains ??
-  	       parsed?.summary?.dofollow_refdomains ??
-              null;
-            if (rd !== null) break;
-          } catch {}
+        if (b.type !== "text" || typeof b.text !== "string") continue;
+
+        try {
+          const parsed = JSON.parse(b.text);
+
+          // ✅ Case A: Ahrefs returns an array under "refdomains"
+          if (Array.isArray(parsed?.refdomains) && parsed.refdomains.length > 0) {
+            const v = parsed.refdomains[0]?.dofollow_refdomains;
+            if (v !== undefined && v !== null) {
+              rd = Number(v);
+              if (!Number.isNaN(rd)) break;
+            }
+          }
+
+          // ✅ Case B: Ahrefs returns a direct value (fallback)
+          if (parsed?.dofollow_refdomains !== undefined && parsed.dofollow_refdomains !== null) {
+            rd = Number(parsed.dofollow_refdomains);
+            if (!Number.isNaN(rd)) break;
+          }
+
+          // ✅ Additional fallbacks (just in case)
+          if (parsed?.metrics?.dofollow_refdomains != null) {
+            rd = Number(parsed.metrics.dofollow_refdomains);
+            if (!Number.isNaN(rd)) break;
+          }
+          if (parsed?.summary?.dofollow_refdomains != null) {
+            rd = Number(parsed.summary.dofollow_refdomains);
+            if (!Number.isNaN(rd)) break;
+          }
+        } catch {
+          // ignore non-json text
         }
       }
 
-      if (rd === null) {
+      if (rd === null || Number.isNaN(rd)) {
         return {
           ok: false,
-          error: "Referring domains not found in Ahrefs response.",
-          raw_result: r
+          error: "Could not extract dofollow_refdomains from Ahrefs response.",
+          hint: "Check raw_result -> content text. If it contains refdomains array, we use [0].dofollow_refdomains.",
+          raw_result: r,
         };
       }
 
-      rd = Number(rd);
       const rec = recommendLinksFromRD(rd);
 
       return {
         ok: true,
         target,
         mode,
-        referring_domains: rd,
+        referring_domains_dofollow: rd,
         recommended_backlinks_min: rec.min,
         recommended_backlinks_max: rec.max,
-        rationale: rec.rationale
+        rationale: rec.rationale,
       };
     });
 
     if (!result.ok) return res.status(502).json(result);
     res.json(result);
-
   } catch (e) {
     res.status(500).json({
       ok: false,
       error: "Unexpected server error",
-      message: String(e?.message || e)
+      message: String(e?.message || e),
     });
   }
 });
