@@ -44,6 +44,7 @@ async function withAhrefsMcp(fn) {
   // Most MCP servers authenticate using headers.
   // We'll send BOTH common patterns to avoid guessing wrong:
   const headers = {
+    "X-Ahrefs-Api-Token": AHREFS_MCP_KEY,
     "Authorization": `Bearer ${AHREFS_MCP_KEY}`,
     "X-API-Key": AHREFS_MCP_KEY
   };
