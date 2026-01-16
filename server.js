@@ -9,8 +9,9 @@ const PROXY_KEY = process.env.PROXY_KEY || "";
 const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 
 const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
-const BUILD_VERSION = "2026-01-17-02";
+const BUILD_VERSION = "2026-01-17-03";
 
+// --- Helpers ---
 function requireProxyKey(req, res) {
   const provided = req.header("X-TRANKS-PROXY-KEY");
   if (!PROXY_KEY || !provided || provided !== PROXY_KEY) {
@@ -52,6 +53,10 @@ function normalizeAndDetect(input) {
   return { isHomepage, hostname, fullUrl };
 }
 
+function todayYYYYMMDD() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 async function withAhrefsMcp(fn) {
   if (!AHREFS_MCP_KEY) throw new Error("Missing AHREFS_MCP_KEY env var.");
 
@@ -78,7 +83,7 @@ async function withAhrefsMcp(fn) {
   }
 }
 
-function extractNumbersFromJSONTextBlocks(r) {
+function extractFirstJSONText(r) {
   const blocks = r?.content || [];
   for (const b of blocks) {
     if (b.type !== "text" || typeof b.text !== "string") continue;
@@ -89,6 +94,7 @@ function extractNumbersFromJSONTextBlocks(r) {
   return null;
 }
 
+// --- Routes ---
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "ahrefs-mcp-bridge", version: BUILD_VERSION });
 });
@@ -100,10 +106,24 @@ app.get("/debug-tools", async (req, res) => {
     const out = await withAhrefsMcp(async (client) => await client.listTools());
     res.json({ ok: true, mcp_url: AHREFS_MCP_URL, tools: out });
   } catch (e) {
-    res.status(500).json({ ok: false, error: "Failed to connect/list tools via Ahrefs MCP.", message: String(e?.message || e) });
+    res.status(500).json({
+      ok: false,
+      error: "Failed to connect/list tools via Ahrefs MCP.",
+      message: String(e?.message || e),
+    });
   }
 });
 
+/**
+ * GET /recommend-links?target=...&requested_links=...&date=YYYY-MM-DD
+ *
+ * Homepage -> scope: subdomains on hostname
+ * Innerpage -> scope: exact URL
+ *
+ * Returns BOTH:
+ * - referring_domains_all
+ * - referring_domains_dofollow
+ */
 app.get("/recommend-links", async (req, res) => {
   if (!requireProxyKey(req, res)) return;
 
@@ -113,39 +133,51 @@ app.get("/recommend-links", async (req, res) => {
   const requestedLinksRaw = req.query.requested_links?.toString();
   const requestedLinks = requestedLinksRaw ? Number(requestedLinksRaw) : null;
 
+  const date = (req.query.date?.toString() || todayYYYYMMDD()); // ✅ required by Ahrefs tools
+
   try {
     const result = await withAhrefsMcp(async (client) => {
       const parsed = normalizeAndDetect(inputTarget);
 
-      const args = parsed.isHomepage
+      const baseArgs = parsed.isHomepage
         ? { target: parsed.hostname, mode: "subdomains" }
         : { target: parsed.fullUrl };
 
-      // 1) Try site-explorer-metrics (best match for “overview”)
-      let metricsResp = null;
+      // ✅ Always include date (required)
+      const args = { ...baseArgs, date };
+
+      // 1) Try site-explorer-metrics (overview-like)
+      let data = null;
+      let usedTool = null;
+
       try {
-        metricsResp = await client.callTool({
+        const r1 = await client.callTool({
           name: "site-explorer-metrics",
           arguments: { ...args, limit: 1 },
         });
+        data = extractFirstJSONText(r1);
+        usedTool = "site-explorer-metrics";
       } catch (_) {}
-
-      let data = metricsResp ? extractNumbersFromJSONTextBlocks(metricsResp) : null;
 
       // 2) Fallback: site-explorer-backlinks-stats
       if (!data) {
-        const backlinksStatsResp = await client.callTool({
+        const r2 = await client.callTool({
           name: "site-explorer-backlinks-stats",
           arguments: { ...args, limit: 1 },
         });
-        data = extractNumbersFromJSONTextBlocks(backlinksStatsResp);
+        data = extractFirstJSONText(r2);
+        usedTool = "site-explorer-backlinks-stats";
       }
 
       if (!data) {
-        return { ok: false, error: "Could not parse Ahrefs response JSON.", debug: { args_used: args, resolved: parsed } };
+        return {
+          ok: false,
+          error: "Could not parse Ahrefs response JSON.",
+          debug: { args_used: args, resolved: parsed, usedTool },
+        };
       }
 
-      // Attempt to find both ALL and DOFOLLOW RD in typical locations
+      // Try typical locations
       const rdAll =
         data?.metrics?.refdomains ??
         data?.refdomains ??
@@ -159,10 +191,15 @@ app.get("/recommend-links", async (req, res) => {
         null;
 
       if (rdAll == null && rdDofollow == null) {
-        return { ok: false, error: "No RD fields found (refdomains / dofollow_refdomains).", raw: data, debug: { args_used: args, resolved: parsed } };
+        return {
+          ok: false,
+          error: "No RD fields found (refdomains / dofollow_refdomains).",
+          raw: data,
+          debug: { args_used: args, resolved: parsed, usedTool },
+        };
       }
 
-      // Choose ALL RD for package logic (matches Ahrefs UI better)
+      // Use ALL RD for package if available (matches UI better)
       const rdForPackage = rdAll != null ? Number(rdAll) : Number(rdDofollow);
       const pkg = packageFromRD(rdForPackage);
 
@@ -180,9 +217,12 @@ app.get("/recommend-links", async (req, res) => {
 
       return {
         ok: true,
+        build_version: BUILD_VERSION,
+        date_used: date,
         input_target: inputTarget,
         resolved_scope: parsed.isHomepage ? "homepage(subdomains)" : "innerpage(exact-url)",
         target_used: parsed.isHomepage ? parsed.hostname : parsed.fullUrl,
+        tool_used: usedTool,
 
         referring_domains_all: rdAll != null ? Number(rdAll) : null,
         referring_domains_dofollow: rdDofollow != null ? Number(rdDofollow) : null,
@@ -201,7 +241,11 @@ app.get("/recommend-links", async (req, res) => {
     return res.json(result);
 
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "Unexpected server error", message: String(e?.message || e) });
+    return res.status(500).json({
+      ok: false,
+      error: "Unexpected server error",
+      message: String(e?.message || e),
+    });
   }
 });
 
