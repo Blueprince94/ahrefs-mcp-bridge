@@ -9,10 +9,8 @@ const PROXY_KEY = process.env.PROXY_KEY || "";
 const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
 
-// bump when redeploy
-const BUILD_VERSION = "2026-01-17-04";
+const BUILD_VERSION = "2026-01-17-05";
 
-// --- Helpers ---
 function requireProxyKey(req, res) {
   const provided = req.header("X-TRANKS-PROXY-KEY");
   if (!PROXY_KEY || !provided || provided !== PROXY_KEY) {
@@ -96,34 +94,43 @@ function extractFirstJSONText(r) {
 }
 
 /**
- * Try to find RD fields across common shapes.
- * Returns { rd_all, rd_dofollow } (numbers or null)
+ * Deep-search JSON for keys anywhere (Ahrefs MCP nesting varies)
  */
-function extractRD(json) {
-  if (!json) return { rd_all: null, rd_dofollow: null };
+function deepFindNumber(obj, keys) {
+  const wanted = new Set(keys);
+  const seen = new Set();
 
-  // common: { metrics: { refdomains, dofollow_refdomains } }
-  const m = json.metrics || json.summary || json;
+  function walk(x) {
+    if (x === null || x === undefined) return null;
+    if (typeof x !== "object") return null;
+    if (seen.has(x)) return null;
+    seen.add(x);
 
-  const rdAll =
-    m.refdomains ??
-    m.referring_domains ??
-    json.refdomains ??
-    null;
+    if (Array.isArray(x)) {
+      for (const item of x) {
+        const r = walk(item);
+        if (r != null) return r;
+      }
+      return null;
+    }
 
-  const rdDofollow =
-    m.dofollow_refdomains ??
-    m.referring_domains_dofollow ??
-    json.dofollow_refdomains ??
-    null;
+    for (const [k, v] of Object.entries(x)) {
+      if (wanted.has(k) && v != null) {
+        const n = Number(v);
+        if (!Number.isNaN(n)) return n;
+      }
+    }
 
-  return {
-    rd_all: rdAll != null ? Number(rdAll) : null,
-    rd_dofollow: rdDofollow != null ? Number(rdDofollow) : null,
-  };
+    for (const v of Object.values(x)) {
+      const r = walk(v);
+      if (r != null) return r;
+    }
+    return null;
+  }
+
+  return walk(obj);
 }
 
-// --- Routes ---
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "ahrefs-mcp-bridge", version: BUILD_VERSION });
 });
@@ -151,92 +158,81 @@ app.get("/recommend-links", async (req, res) => {
 
   try {
     const result = await withAhrefsMcp(async (client) => {
-      let usedTool = null;
-      let json = null;
+      const toolDebug = [];
 
-      // ✅ 1) PRIMARY: backlinks stats (this is where RD should live)
+      // ✅ 1) backlinks-stats (best source for RD)
+      let r1 = null, j1 = null, err1 = null;
       try {
-        const r1 = await client.callTool({
+        r1 = await client.callTool({
           name: "site-explorer-backlinks-stats",
-          arguments: { ...scopeArgs, date },
+          arguments: {
+            ...scopeArgs,
+            date,
+            output: "json",
+          },
         });
-        json = extractFirstJSONText(r1);
-        usedTool = "site-explorer-backlinks-stats";
+        j1 = extractFirstJSONText(r1);
       } catch (e) {
-        // keep going
+        err1 = String(e?.message || e);
       }
+      toolDebug.push({ tool: "site-explorer-backlinks-stats", args: { ...scopeArgs, date, output: "json" }, err: err1, json: j1 });
 
-      // If RD missing, try next tool
-      let { rd_all, rd_dofollow } = extractRD(json);
+      // Try to extract RD from backlinks-stats response
+      let rd_all = deepFindNumber(j1, ["refdomains", "referring_domains"]);
+      let rd_dofollow = deepFindNumber(j1, ["dofollow_refdomains", "referring_domains_dofollow"]);
 
-      // ✅ 2) FALLBACK: referring domains list endpoint (may expose dofollow_refdomains)
+      // ✅ 2) referring-domains fallback (this endpoint often needs select+limit; DOES NOT require date per the tool list)
+      let r2 = null, j2 = null, err2 = null;
       if (rd_all == null && rd_dofollow == null) {
         try {
-          const r2 = await client.callTool({
+          r2 = await client.callTool({
             name: "site-explorer-referring-domains",
             arguments: {
               ...scopeArgs,
-              date,
-              // ask for both if supported; if not, Ahrefs will ignore/err and we’ll report it
-              select: "dofollow_refdomains,refdomains",
+              select: "dofollow_refdomains",
               limit: 1,
+              order_by: "dofollow_refdomains:desc",
+              output: "json",
             },
           });
-          const j2 = extractFirstJSONText(r2);
-          json = j2;
-          usedTool = "site-explorer-referring-domains";
-
-          ({ rd_all, rd_dofollow } = extractRD(json));
-
-          // Special case: sometimes returns array under "refdomains"
-          if ((rd_all == null && rd_dofollow == null) && Array.isArray(j2?.refdomains) && j2.refdomains.length) {
-            const first = j2.refdomains[0];
-            const vAll = first?.refdomains ?? null;
-            const vDo = first?.dofollow_refdomains ?? null;
-            rd_all = vAll != null ? Number(vAll) : rd_all;
-            rd_dofollow = vDo != null ? Number(vDo) : rd_dofollow;
-          }
+          j2 = extractFirstJSONText(r2);
         } catch (e) {
-          // keep going
+          err2 = String(e?.message || e);
         }
+        toolDebug.push({
+          tool: "site-explorer-referring-domains",
+          args: { ...scopeArgs, select: "dofollow_refdomains", limit: 1, order_by: "dofollow_refdomains:desc", output: "json" },
+          err: err2,
+          json: j2,
+        });
+
+        // some responses come as an array of rows; deep search catches both
+        rd_all = deepFindNumber(j2, ["refdomains", "referring_domains"]) ?? rd_all;
+        rd_dofollow = deepFindNumber(j2, ["dofollow_refdomains", "referring_domains_dofollow"]) ?? rd_dofollow;
       }
 
-      // ✅ 3) LAST RESORT: metrics (won't usually have RD, but at least gives something)
-      if (rd_all == null && rd_dofollow == null) {
-        try {
-          const r3 = await client.callTool({
-            name: "site-explorer-metrics",
-            arguments: { ...scopeArgs, date },
-          });
-          json = extractFirstJSONText(r3);
-          usedTool = "site-explorer-metrics";
-          ({ rd_all, rd_dofollow } = extractRD(json));
-        } catch (e) {}
-      }
+      // ✅ Decide what to use for package (prefer ALL ref domains to match UI better)
+      const rd_used = (rd_all != null ? rd_all : rd_dofollow);
 
-      if (rd_all == null && rd_dofollow == null) {
+      if (rd_used == null) {
         return {
           ok: false,
-          error: "RD not returned by Ahrefs tools. (backlinks-stats + referring-domains returned no RD fields)",
+          error: "RD not returned by Ahrefs tools (or tools errored).",
           debug: {
             date_used: date,
             resolved_scope: parsed.isHomepage ? "homepage(subdomains)" : "innerpage(exact-url)",
             target_used: parsed.isHomepage ? parsed.hostname : parsed.fullUrl,
-            last_tool_attempted: usedTool,
-            last_json: json,
+            tool_debug: toolDebug, // <-- THIS will finally show the real cause
           },
         };
       }
 
-      // Prefer ALL RD if present (matches Ahrefs UI “Ref. domains” better)
-      const rdForPackage = rd_all != null ? rd_all : rd_dofollow;
-
-      const pkg = packageFromRD(rdForPackage);
+      const pkg = packageFromRD(rd_used);
 
       // Dripfeed rule: if low RD but client requests bigger than recommended
       let dripfeed = { enabled: false };
       if (requestedLinks != null && !Number.isNaN(requestedLinks)) {
-        if (rdForPackage <= 20 && requestedLinks > pkg.max) {
+        if (rd_used <= 20 && requestedLinks > pkg.max) {
           dripfeed = {
             enabled: true,
             rate: "1 link every 2 days",
@@ -249,19 +245,18 @@ app.get("/recommend-links", async (req, res) => {
         ok: true,
         build_version: BUILD_VERSION,
         date_used: date,
-
         input_target: inputTarget,
         resolved_scope: parsed.isHomepage ? "homepage(subdomains)" : "innerpage(exact-url)",
         target_used: parsed.isHomepage ? parsed.hostname : parsed.fullUrl,
-        tool_used: usedTool,
 
         referring_domains_all: rd_all,
         referring_domains_dofollow: rd_dofollow,
-        referring_domains_used_for_package: rdForPackage,
+        referring_domains_used_for_package: rd_used,
 
         recommended_backlinks_min: pkg.min,
         recommended_backlinks_max: pkg.max,
         dripfeed,
+        debug: { tool_debug: toolDebug },
       };
     });
 
