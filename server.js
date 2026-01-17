@@ -8,9 +8,11 @@ app.use(express.json());
 const PROXY_KEY = process.env.PROXY_KEY || "";
 const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
+
+// bump this whenever you redeploy so you can confirm Railway is running new build
 const BUILD_VERSION = "2026-01-17-02";
 
-// ---------------- AUTH ----------------
+// -------------------- Helpers --------------------
 function requireProxyKey(req, res) {
   const provided = req.header("X-TRANKS-PROXY-KEY");
   if (!PROXY_KEY || !provided || provided !== PROXY_KEY) {
@@ -20,108 +22,99 @@ function requireProxyKey(req, res) {
   return true;
 }
 
-// ---------------- YOUR PACKAGE RULES ----------------
-function recommendPackageFromRD(rdLive) {
-  // PACKAGE RECOMMENDATION (Base on Referring Domains - LIVE)
-  // 0-10 = 5 links
-  // 10-20 = 10 links
-  // 30-80 = 15 links
-  // 80-120 = 20 links
-  // 120-200 = 25 links
-  // 200+ = at least 25 links then offer upto 50 links.
-
-  if (rdLive <= 10) return { min: 5, max: 5, tier: "5 links" };
-  if (rdLive <= 20) return { min: 10, max: 10, tier: "10 links" };
-  if (rdLive < 30) return { min: 10, max: 10, tier: "10 links" }; // your gap 20-30
-  if (rdLive <= 80) return { min: 15, max: 15, tier: "15 links" };
-  if (rdLive <= 120) return { min: 20, max: 20, tier: "20 links" };
-  if (rdLive <= 200) return { min: 25, max: 25, tier: "25 links" };
-  return { min: 25, max: 50, tier: "25–50 links" };
+function todayISO() {
+  // Ahrefs MCP tools often require date (YYYY-MM-DD)
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-function dripfeedIfOversizedOrder(rdLive, clientRequestedLinks) {
-  // If client wants large amount despite low RD, allow but dripfeed 1 link every 2 days.
-  if (!clientRequestedLinks) return { enabled: false };
+function parseTarget(input) {
+  // Accepts:
+  // - stellarrank.net
+  // - https://stellarrank.net
+  // - https://stellarrank.net/pricing
+  // Returns: { isHomepage, hostname, fullUrl, normalizedInput }
+  let normalizedInput = (input || "").trim();
+  if (!normalizedInput) throw new Error("Missing target");
 
-  const rec = recommendPackageFromRD(rdLive);
-  const oversized = Number(clientRequestedLinks) > Number(rec.max);
-
-  if (rdLive <= 20 && oversized) {
-    return {
-      enabled: true,
-      rate: "1 link every 2 days",
-      reason: "Low RD footprint; slower velocity reduces risk while allowing larger order.",
-    };
-  }
-
-  if (oversized) {
-    return {
-      enabled: true,
-      rate: "1 link every 2 days",
-      reason: "Requested links exceed recommended range; dripfeed reduces velocity risk.",
-    };
-  }
-
-  return { enabled: false };
-}
-
-// ---------------- URL SCOPE RESOLUTION (OBJECTIVE) ----------------
-function resolveTargetAndScope(input) {
-  // Rule:
-  // - homepage => subdomains scope
-  // - innerpage => exact URL scope
-  const raw = (input || "").trim();
-  const forParse = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `https://${raw}`;
+  // If no protocol, add https for parsing only
+  const forUrl = normalizedInput.startsWith("http://") || normalizedInput.startsWith("https://")
+    ? normalizedInput
+    : `https://${normalizedInput}`;
 
   let u;
   try {
-    u = new URL(forParse);
+    u = new URL(forUrl);
   } catch {
-    const hostname = raw.replace(/\/+$/g, "");
+    throw new Error("Invalid target URL/domain");
+  }
+
+  const hostname = u.hostname.replace(/^www\./, "");
+  const pathname = u.pathname || "/";
+
+  // homepage if path is "/" OR empty
+  const isHomepage = pathname === "/" || pathname === "";
+
+  const fullUrl = `https://${hostname}${pathname}${u.search || ""}`;
+
+  return { isHomepage, hostname, fullUrl, normalizedInput };
+}
+
+function enforceScopeRule(inputTarget) {
+  const resolved = parseTarget(inputTarget);
+
+  // RULE:
+  // homepage => mode=subdomains, target_used=hostname
+  // innerpage => mode=exact, target_used=fullUrl
+  if (resolved.isHomepage) {
     return {
-      ok: true,
-      input_target: raw,
       resolved_scope: "homepage(subdomains)",
-      mode: "subdomains",
-      target_used: hostname,
-      fullUrl: `https://${hostname}/`,
-      hostname,
-      isHomepage: true,
+      mode_used: "subdomains",
+      target_used: resolved.hostname,
+      resolved,
     };
   }
 
-  const hostname = u.hostname;
-  const path = (u.pathname || "/").trim();
-  const isHomepage = path === "/" || path === "" || path === "//";
-
-  if (isHomepage) {
-    return {
-      ok: true,
-      input_target: raw,
-      resolved_scope: "homepage(subdomains)",
-      mode: "subdomains",
-      target_used: hostname,
-      fullUrl: `https://${hostname}/`,
-      hostname,
-      isHomepage: true,
-    };
-  }
-
-  u.hash = "";
-  const normalized = u.toString().replace(/\/+$/g, "");
   return {
-    ok: true,
-    input_target: raw,
     resolved_scope: "innerpage(exact)",
-    mode: "exact",
-    target_used: normalized,
-    fullUrl: normalized,
-    hostname,
-    isHomepage: false,
+    mode_used: "exact",
+    target_used: resolved.fullUrl,
+    resolved,
   };
 }
 
-// ---------------- MCP CLIENT ----------------
+// PACKAGE RECOMMENDATION (based on LIVE referring domains)
+function packageFromRD(rdLive) {
+  const rd = Number(rdLive);
+
+  // Your tiers (filled the missing 21–29 gap by extending the 30–80 tier downwards safely)
+  if (rd <= 10) return { min: 5, max: 5, tier: "5 links" };
+  if (rd <= 20) return { min: 10, max: 10, tier: "10 links" };
+  if (rd <= 80) return { min: 15, max: 15, tier: "15 links" };
+  if (rd <= 120) return { min: 20, max: 20, tier: "20 links" };
+  if (rd <= 200) return { min: 25, max: 25, tier: "25 links" };
+
+  // 200 above: at least 25, offer up to 50
+  return { min: 25, max: 50, tier: "25–50 links" };
+}
+
+// DRIPFEED RULE (based on LIVE referring domains)
+function dripfeedFromRD(rdLive) {
+  const rd = Number(rdLive);
+
+  if (rd <= 20) {
+    return { enabled: true, rate: "1 link every 2 days", reason: "Low RD (0–20) — slower velocity is safer." };
+  }
+  if (rd <= 100) {
+    return { enabled: true, rate: "1 link per day", reason: "Moderate RD (21–100) — steady daily growth." };
+  }
+  return { enabled: true, rate: "2–3 links per day", reason: "Strong RD (101+) — can sustain faster pacing." };
+}
+
+// -------------------- MCP Client --------------------
 async function withAhrefsMcp(fn) {
   if (!AHREFS_MCP_KEY) throw new Error("Missing AHREFS_MCP_KEY env var.");
 
@@ -135,112 +128,148 @@ async function withAhrefsMcp(fn) {
     requestInit: { headers },
   });
 
-  const client = new Client({ name: "ahrefs-mcp-bridge", version: "1.0.0" }, { capabilities: {} });
+  const client = new Client(
+    { name: "ahrefs-mcp-bridge", version: "1.0.0" },
+    { capabilities: {} }
+  );
 
   await client.connect(transport);
   try {
     return await fn(client);
   } finally {
-    try {
-      await client.close();
-    } catch (_) {}
+    try { await client.close(); } catch (_) {}
   }
 }
 
-function parseFirstJsonTextBlock(mcpResult) {
-  const blocks = mcpResult?.content || [];
-  for (const b of blocks) {
-    if (b?.type === "text" && typeof b.text === "string") {
-      try {
-        return JSON.parse(b.text);
-      } catch {}
-    }
-  }
-  return null;
-}
-
-// ---------------- ROUTES ----------------
+// -------------------- Routes --------------------
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "ahrefs-mcp-bridge", version: BUILD_VERSION });
 });
 
+app.get("/debug-tools", async (req, res) => {
+  if (!requireProxyKey(req, res)) return;
+
+  try {
+    const out = await withAhrefsMcp(async (client) => await client.listTools());
+    res.json({ ok: true, mcp_url: AHREFS_MCP_URL, tools: out });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: "Failed to connect/list tools via Ahrefs MCP.",
+      message: String(e?.message || e),
+    });
+  }
+});
+
+/**
+ * GET /recommend-links?target=...  (target can be homepage or innerpage URL)
+ * Optional:
+ * - desired_links=number  (if client wants bigger than recommended; we still allow, but dripfeed remains RD-based)
+ */
 app.get("/recommend-links", async (req, res) => {
   if (!requireProxyKey(req, res)) return;
 
-  const target = req.query.target?.toString();
-  const clientLinks = req.query.client_links ? Number(req.query.client_links) : null;
+  const input_target = req.query.target?.toString();
+  const desired_links = req.query.desired_links ? Number(req.query.desired_links) : null;
 
-  if (!target) return res.status(400).json({ ok: false, error: "Missing required query param: target" });
+  if (!input_target) {
+    return res.status(400).json({ ok: false, error: "Missing required query param: target" });
+  }
 
-  const resolved = resolveTargetAndScope(target);
-  const date = new Date().toISOString().slice(0, 10);
+  const date = todayISO();
+  const enforced = enforceScopeRule(input_target);
 
   try {
     const result = await withAhrefsMcp(async (client) => {
-      const tool = "site-explorer-backlinks-stats";
+      // We use backlinks-stats because it reliably returns live_refdomains/all_time_refdomains
+      // and is aligned with “live referring domains” requirement.
+      const toolName = "site-explorer-backlinks-stats";
 
       const r = await client.callTool({
-        name: tool,
+        name: toolName,
         arguments: {
-          target: resolved.target_used,
-          mode: resolved.mode,
+          target: enforced.target_used,
+          mode: enforced.mode_used,
           date,
+          select: "live_refdomains,all_time_refdomains",
+          limit: 1,
         },
       });
 
-      const parsed = parseFirstJsonTextBlock(r);
+      const blocks = r?.content || [];
+      let live = null;
+      let allTime = null;
+      let lastJson = null;
 
-      // ✅ THIS IS THE FIX:
-      // Ahrefs returns RD as metrics.live_refdomains / metrics.all_time_refdomains
-      const liveRD = parsed?.metrics?.live_refdomains;
-      const allTimeRD = parsed?.metrics?.all_time_refdomains;
+      for (const b of blocks) {
+        if (b.type !== "text" || typeof b.text !== "string") continue;
+        try {
+          const parsed = JSON.parse(b.text);
+          lastJson = parsed;
 
-      if (liveRD === undefined || liveRD === null) {
+          // common shape: { metrics: { live_refdomains, all_time_refdomains } }
+          if (parsed?.metrics) {
+            if (parsed.metrics.live_refdomains != null) live = Number(parsed.metrics.live_refdomains);
+            if (parsed.metrics.all_time_refdomains != null) allTime = Number(parsed.metrics.all_time_refdomains);
+          }
+
+          // fallback if returned flat
+          if (live == null && parsed?.live_refdomains != null) live = Number(parsed.live_refdomains);
+          if (allTime == null && parsed?.all_time_refdomains != null) allTime = Number(parsed.all_time_refdomains);
+
+          if (live != null && !Number.isNaN(live)) break;
+        } catch {
+          // ignore non-json
+        }
+      }
+
+      if (live == null || Number.isNaN(live)) {
         return {
           ok: false,
-          error: "live_refdomains not returned by Ahrefs backlinks-stats.",
-          enforced_rule: resolved.resolved_scope,
-          target_used: resolved.target_used,
-          mode_used: resolved.mode,
-          date_used: date,
-          tool,
-          raw_json: parsed ?? null,
+          error: "Could not extract live_refdomains from Ahrefs response.",
+          debug: {
+            tool: toolName,
+            date_used: date,
+            enforced_rule: enforced.resolved_scope,
+            args_used: { target: enforced.target_used, mode: enforced.mode_used, date },
+            last_json: lastJson,
+            raw_result: r,
+          },
         };
       }
 
-      const rdLive = Number(liveRD);
-      const rdAllTime = allTimeRD == null ? null : Number(allTimeRD);
+      if (allTime == null || Number.isNaN(allTime)) allTime = live; // safe fallback
 
-      if (Number.isNaN(rdLive)) {
-        return {
-          ok: false,
-          error: "live_refdomains returned but is not numeric.",
-          raw_json: parsed ?? null,
-        };
-      }
+      const pkg = packageFromRD(live);
+      const drip = dripfeedFromRD(live);
 
-      const rec = recommendPackageFromRD(rdLive);
-      const dripfeed = dripfeedIfOversizedOrder(rdLive, clientLinks);
+      // If client requests bigger than recommended max, allow but keep dripfeed (still RD-based rule)
+      const override = (desired_links != null && !Number.isNaN(desired_links) && desired_links > pkg.max)
+        ? {
+            requested_links: desired_links,
+            allowed: true,
+            note: "Requested links exceed the recommended tier. Allowed, but pacing must follow dripfeed guidance.",
+          }
+        : null;
 
       return {
         ok: true,
-        input_target: resolved.input_target,
 
-        // ✅ Proof we followed your rule:
-        resolved_scope: resolved.resolved_scope,
-        mode_used: resolved.mode,
-        target_used: resolved.target_used,
+        input_target,
+        resolved_scope: enforced.resolved_scope,
+        mode_used: enforced.mode_used,
+        target_used: enforced.target_used,
 
-        // ✅ The numbers you care about:
-        referring_domains_live: rdLive,
-        referring_domains_all_time: rdAllTime,
+        referring_domains_live: live,
+        referring_domains_all_time: allTime,
 
-        // ✅ Recommendation uses LIVE RD:
-        recommended_backlinks_min: rec.min,
-        recommended_backlinks_max: rec.max,
-        package_tier: rec.tier,
+        recommended_backlinks_min: pkg.min,
+        recommended_backlinks_max: pkg.max,
+        package_tier: pkg.tier,
 
-        dripfeed,
+        dripfeed: drip, // ALWAYS enabled per your rule
+
+        ...(override ? { override } : {}),
         date_used: date,
       };
     });
@@ -248,7 +277,11 @@ app.get("/recommend-links", async (req, res) => {
     if (!result.ok) return res.status(502).json(result);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ ok: false, error: "Unexpected server error", message: String(e?.message || e) });
+    res.status(500).json({
+      ok: false,
+      error: "Unexpected server error",
+      message: String(e?.message || e),
+    });
   }
 });
 
