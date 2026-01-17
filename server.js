@@ -8,9 +8,9 @@ app.use(express.json());
 const PROXY_KEY = process.env.PROXY_KEY || "";
 const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
+const BUILD_VERSION = "2026-01-17-01";
 
-const BUILD_VERSION = "2026-01-17-05";
-
+// ---------------- AUTH ----------------
 function requireProxyKey(req, res) {
   const provided = req.header("X-TRANKS-PROXY-KEY");
   if (!PROXY_KEY || !provided || provided !== PROXY_KEY) {
@@ -20,42 +20,114 @@ function requireProxyKey(req, res) {
   return true;
 }
 
-/**
- * PACKAGE RULES (based on Referring Domains)
- * 0-10 = 5 links
- * 10-20 = 10 links
- * 30-80 = 15 links
- * 80-120 = 20 links
- * 120-200 = 25 links
- * 200+ = 25-50 links
- */
-function packageFromRD(rd) {
-  if (rd <= 10) return { min: 5, max: 5 };
-  if (rd <= 20) return { min: 10, max: 10 };
-  if (rd <= 29) return { min: 10, max: 10 }; // gap-safe
-  if (rd <= 80) return { min: 15, max: 15 };
-  if (rd <= 120) return { min: 20, max: 20 };
-  if (rd <= 200) return { min: 25, max: 25 };
-  return { min: 25, max: 50 };
+// ---------------- YOUR PACKAGE RULES ----------------
+function recommendPackageFromRD(rd) {
+  // USER RULES:
+  // 0-10 = 5 links
+  // 10-20 = 10 links
+  // 30-80 = 15 links
+  // 80-120 = 20 links
+  // 120-200 = 25 links
+  // 200+ = at least 25 links, offer up to 50 links
+  //
+  // NOTE: your rules skip 20-30. We'll treat 20-29 as 10 links (closest lower bracket),
+  // and 21-29 is still closer to the "10 links" tier than "15 links".
+  if (rd <= 10) return { min: 5, max: 5, tier: "5 links" };
+  if (rd <= 20) return { min: 10, max: 10, tier: "10 links" };
+  if (rd < 30) return { min: 10, max: 10, tier: "10 links" };
+  if (rd <= 80) return { min: 15, max: 15, tier: "15 links" };
+  if (rd <= 120) return { min: 20, max: 20, tier: "20 links" };
+  if (rd <= 200) return { min: 25, max: 25, tier: "25 links" };
+  return { min: 25, max: 50, tier: "25–50 links" };
 }
 
-function todayYYYYMMDD() {
-  return new Date().toISOString().slice(0, 10);
+function dripfeedIfOversizedOrder(rd, clientRequestedLinks) {
+  // USER RULE: If client wants large amount despite low RD, allow but dripfeed 1 link every 2 days.
+  // We'll define "low RD" as <= 20 OR clientRequested > recommended max
+  if (!clientRequestedLinks) return null;
+
+  const rec = recommendPackageFromRD(rd);
+  const oversized = Number(clientRequestedLinks) > Number(rec.max);
+
+  if (rd <= 20 && oversized) {
+    return {
+      enabled: true,
+      rate: "1 link every 2 days",
+      reason: "Low RD footprint; slower velocity reduces risk while allowing larger order."
+    };
+  }
+
+  if (oversized) {
+    return {
+      enabled: true,
+      rate: "1 link every 2 days",
+      reason: "Requested links exceed recommended range; dripfeed reduces velocity risk."
+    };
+  }
+
+  return { enabled: false };
 }
 
-function normalizeTarget(input) {
-  let raw = (input || "").trim();
-  if (raw && !raw.startsWith("http://") && !raw.startsWith("https://")) raw = "https://" + raw;
+// ---------------- URL SCOPE RESOLUTION (OBJECTIVE) ----------------
+function resolveTargetAndScope(input) {
+  // Accept: domain, hostname, or full URL
+  // Objective rule:
+  // - homepage => subdomains (domain-wide including www)
+  // - innerpage => exact URL
+  const raw = (input || "").trim();
 
-  const u = new URL(raw);
-  const hostname = u.hostname.replace(/^www\./, "");
-  const path = u.pathname || "/";
-  const isHomepage = path === "/" || path === "";
+  // If user passes "example.com" without protocol, add https:// for parsing only
+  const forParse = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `https://${raw}`;
 
-  const fullUrl = `${u.protocol}//${hostname}${path}${u.search || ""}`;
-  return { isHomepage, hostname, fullUrl };
+  let u;
+  try {
+    u = new URL(forParse);
+  } catch {
+    // fallback: treat as hostname
+    const hostname = raw.replace(/\/+$/g, "");
+    return {
+      ok: true,
+      input_target: raw,
+      resolved_scope: "homepage(subdomains)",
+      mode: "subdomains",
+      target_used: hostname,
+      fullUrl: `https://${hostname}/`,
+      hostname
+    };
+  }
+
+  const hostname = u.hostname;
+  const path = (u.pathname || "/").trim();
+  const isHomepage = path === "/" || path === "" || path === "//";
+
+  if (isHomepage) {
+    return {
+      ok: true,
+      input_target: raw,
+      resolved_scope: "homepage(subdomains)",
+      mode: "subdomains",
+      target_used: hostname,              // IMPORTANT: domain only
+      fullUrl: `https://${hostname}/`,
+      hostname
+    };
+  }
+
+  // Inner page: exact URL
+  // Normalize: remove trailing slash ONLY for inner pages
+  u.hash = "";
+  const normalized = u.toString().replace(/\/+$/g, "");
+  return {
+    ok: true,
+    input_target: raw,
+    resolved_scope: "innerpage(exact)",
+    mode: "exact",
+    target_used: normalized,              // IMPORTANT: full URL
+    fullUrl: normalized,
+    hostname
+  };
 }
 
+// ---------------- MCP CLIENT ----------------
 async function withAhrefsMcp(fn) {
   if (!AHREFS_MCP_KEY) throw new Error("Missing AHREFS_MCP_KEY env var.");
 
@@ -65,12 +137,13 @@ async function withAhrefsMcp(fn) {
     "X-API-Key": AHREFS_MCP_KEY,
   };
 
-  const transport = new StreamableHTTPClientTransport(new URL(AHREFS_MCP_URL), {
-    requestInit: { headers },
-  });
+  const transport = new StreamableHTTPClientTransport(
+    new URL(AHREFS_MCP_URL),
+    { requestInit: { headers } }
+  );
 
   const client = new Client(
-    { name: "t-ranks-ahrefs-mcp-bridge", version: "1.0.0" },
+    { name: "ahrefs-mcp-bridge", version: "1.0.0" },
     { capabilities: {} }
   );
 
@@ -82,192 +155,142 @@ async function withAhrefsMcp(fn) {
   }
 }
 
-function extractFirstJSONText(r) {
-  const blocks = r?.content || [];
+// ---------------- RD EXTRACTION ----------------
+function tryExtractRD(parsed) {
+  // We want "Referring Domains" like Ahrefs UI count (page/domain scope dependent).
+  // Try common field names that Ahrefs tools may return.
+  return (
+    parsed?.refdomains ??
+    parsed?.referring_domains ??
+    parsed?.metrics?.refdomains ??
+    parsed?.metrics?.referring_domains ??
+    parsed?.stats?.refdomains ??
+    parsed?.stats?.referring_domains ??
+    null
+  );
+}
+
+function parseFirstJsonTextBlock(mcpResult) {
+  const blocks = mcpResult?.content || [];
   for (const b of blocks) {
-    if (b.type !== "text" || typeof b.text !== "string") continue;
-    try {
-      return JSON.parse(b.text);
-    } catch {}
+    if (b?.type === "text" && typeof b.text === "string") {
+      try {
+        return JSON.parse(b.text);
+      } catch {
+        // ignore
+      }
+    }
   }
   return null;
 }
 
-/**
- * Deep-search JSON for keys anywhere (Ahrefs MCP nesting varies)
- */
-function deepFindNumber(obj, keys) {
-  const wanted = new Set(keys);
-  const seen = new Set();
-
-  function walk(x) {
-    if (x === null || x === undefined) return null;
-    if (typeof x !== "object") return null;
-    if (seen.has(x)) return null;
-    seen.add(x);
-
-    if (Array.isArray(x)) {
-      for (const item of x) {
-        const r = walk(item);
-        if (r != null) return r;
-      }
-      return null;
-    }
-
-    for (const [k, v] of Object.entries(x)) {
-      if (wanted.has(k) && v != null) {
-        const n = Number(v);
-        if (!Number.isNaN(n)) return n;
-      }
-    }
-
-    for (const v of Object.values(x)) {
-      const r = walk(v);
-      if (r != null) return r;
-    }
-    return null;
-  }
-
-  return walk(obj);
-}
-
+// ---------------- ROUTES ----------------
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "ahrefs-mcp-bridge", version: BUILD_VERSION });
 });
 
+app.get("/debug-tools", async (req, res) => {
+  if (!requireProxyKey(req, res)) return;
+
+  try {
+    const out = await withAhrefsMcp(async (client) => client.listTools());
+    res.json({ ok: true, mcp_url: AHREFS_MCP_URL, tools: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "Failed to list tools", message: String(e?.message || e) });
+  }
+});
+
+/**
+ * GET /recommend-links?target=<url_or_domain>&client_links=<optional number>
+ * Uses the objective rule:
+ * - homepage -> mode=subdomains, target_used=hostname
+ * - innerpage -> mode=exact, target_used=full URL
+ */
 app.get("/recommend-links", async (req, res) => {
   if (!requireProxyKey(req, res)) return;
 
-  const inputTarget = req.query.target?.toString();
-  if (!inputTarget) {
-    return res.status(400).json({ ok: false, error: "Missing required query param: target" });
-  }
+  const target = req.query.target?.toString();
+  const clientLinks = req.query.client_links ? Number(req.query.client_links) : null;
 
-  const requestedLinksRaw = req.query.requested_links?.toString();
-  const requestedLinks = requestedLinksRaw ? Number(requestedLinksRaw) : null;
+  if (!target) return res.status(400).json({ ok: false, error: "Missing required query param: target" });
 
-  const date = (req.query.date?.toString() || todayYYYYMMDD());
-  const parsed = normalizeTarget(inputTarget);
+  const resolved = resolveTargetAndScope(target);
+  if (!resolved.ok) return res.status(400).json({ ok: false, error: "Invalid target" });
 
-  // Rule:
-  // Homepage => subdomains on hostname
-  // Innerpage => exact URL
-  const scopeArgs = parsed.isHomepage
-    ? { target: parsed.hostname, mode: "subdomains" }
-    : { target: parsed.fullUrl };
+  // Ahrefs MCP tools often require a date argument.
+  const date = new Date().toISOString().slice(0, 10);
 
   try {
     const result = await withAhrefsMcp(async (client) => {
-      const toolDebug = [];
-
-      // ✅ 1) backlinks-stats (best source for RD)
-      let r1 = null, j1 = null, err1 = null;
+      // 1) Use backlinks-stats FIRST (best chance to match UI counts)
+      let usedTool = "site-explorer-backlinks-stats";
+      let r1;
       try {
         r1 = await client.callTool({
           name: "site-explorer-backlinks-stats",
           arguments: {
-            ...scopeArgs,
-            date,
-            output: "json",
-          },
+            target: resolved.target_used,
+            mode: resolved.mode,
+            date
+          }
         });
-        j1 = extractFirstJSONText(r1);
-      } catch (e) {
-        err1 = String(e?.message || e);
-      }
-      toolDebug.push({ tool: "site-explorer-backlinks-stats", args: { ...scopeArgs, date, output: "json" }, err: err1, json: j1 });
-
-      // Try to extract RD from backlinks-stats response
-      let rd_all = deepFindNumber(j1, ["refdomains", "referring_domains"]);
-      let rd_dofollow = deepFindNumber(j1, ["dofollow_refdomains", "referring_domains_dofollow"]);
-
-      // ✅ 2) referring-domains fallback (this endpoint often needs select+limit; DOES NOT require date per the tool list)
-      let r2 = null, j2 = null, err2 = null;
-      if (rd_all == null && rd_dofollow == null) {
-        try {
-          r2 = await client.callTool({
-            name: "site-explorer-referring-domains",
-            arguments: {
-              ...scopeArgs,
-              select: "dofollow_refdomains",
-              limit: 1,
-              order_by: "dofollow_refdomains:desc",
-              output: "json",
-            },
-          });
-          j2 = extractFirstJSONText(r2);
-        } catch (e) {
-          err2 = String(e?.message || e);
-        }
-        toolDebug.push({
-          tool: "site-explorer-referring-domains",
-          args: { ...scopeArgs, select: "dofollow_refdomains", limit: 1, order_by: "dofollow_refdomains:desc", output: "json" },
-          err: err2,
-          json: j2,
-        });
-
-        // some responses come as an array of rows; deep search catches both
-        rd_all = deepFindNumber(j2, ["refdomains", "referring_domains"]) ?? rd_all;
-        rd_dofollow = deepFindNumber(j2, ["dofollow_refdomains", "referring_domains_dofollow"]) ?? rd_dofollow;
-      }
-
-      // ✅ Decide what to use for package (prefer ALL ref domains to match UI better)
-      const rd_used = (rd_all != null ? rd_all : rd_dofollow);
-
-      if (rd_used == null) {
+      } catch (err) {
+        // If "exact" mode isn't accepted by this tool, return the error clearly (do NOT silently switch scope)
         return {
           ok: false,
-          error: "RD not returned by Ahrefs tools (or tools errored).",
-          debug: {
-            date_used: date,
-            resolved_scope: parsed.isHomepage ? "homepage(subdomains)" : "innerpage(exact-url)",
-            target_used: parsed.isHomepage ? parsed.hostname : parsed.fullUrl,
-            tool_debug: toolDebug, // <-- THIS will finally show the real cause
-          },
+          error: "Ahrefs tool call failed for backlinks-stats with the enforced scope rule.",
+          enforced_rule: resolved.resolved_scope,
+          target_used: resolved.target_used,
+          mode_used: resolved.mode,
+          date_used: date,
+          tool: usedTool,
+          message: String(err?.message || err)
         };
       }
 
-      const pkg = packageFromRD(rd_used);
+      const parsed1 = parseFirstJsonTextBlock(r1);
+      const rd1 = tryExtractRD(parsed1);
 
-      // Dripfeed rule: if low RD but client requests bigger than recommended
-      let dripfeed = { enabled: false };
-      if (requestedLinks != null && !Number.isNaN(requestedLinks)) {
-        if (rd_used <= 20 && requestedLinks > pkg.max) {
-          dripfeed = {
-            enabled: true,
-            rate: "1 link every 2 days",
-            reason: "Low RD footprint but larger order requested; slower velocity reduces risk.",
-          };
-        }
+      if (rd1 === null || rd1 === undefined || Number.isNaN(Number(rd1))) {
+        // Fail hard instead of returning wrong numbers from unrelated fields.
+        return {
+          ok: false,
+          error: "Referring Domains not found in backlinks-stats response (no refdomains/referring_domains fields).",
+          enforced_rule: resolved.resolved_scope,
+          target_used: resolved.target_used,
+          mode_used: resolved.mode,
+          date_used: date,
+          tool: usedTool,
+          raw_json: parsed1 ?? null
+        };
       }
+
+      const rd = Number(rd1);
+      const rec = recommendPackageFromRD(rd);
+      const dripfeed = dripfeedIfOversizedOrder(rd, clientLinks);
 
       return {
         ok: true,
-        build_version: BUILD_VERSION,
+        input_target: resolved.input_target,
+        resolved_scope: resolved.resolved_scope,
+        target_used: resolved.target_used,
+        mode_used: resolved.mode,
         date_used: date,
-        input_target: inputTarget,
-        resolved_scope: parsed.isHomepage ? "homepage(subdomains)" : "innerpage(exact-url)",
-        target_used: parsed.isHomepage ? parsed.hostname : parsed.fullUrl,
 
-        referring_domains_all: rd_all,
-        referring_domains_dofollow: rd_dofollow,
-        referring_domains_used_for_package: rd_used,
+        referring_domains: rd,
 
-        recommended_backlinks_min: pkg.min,
-        recommended_backlinks_max: pkg.max,
-        dripfeed,
-        debug: { tool_debug: toolDebug },
+        recommended_backlinks_min: rec.min,
+        recommended_backlinks_max: rec.max,
+        package_tier: rec.tier,
+
+        dripfeed: dripfeed,
       };
     });
 
     if (!result.ok) return res.status(502).json(result);
-    return res.json(result);
+    res.json(result);
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: "Unexpected server error",
-      message: String(e?.message || e),
-    });
+    res.status(500).json({ ok: false, error: "Unexpected server error", message: String(e?.message || e) });
   }
 });
 
