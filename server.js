@@ -8,7 +8,7 @@ app.use(express.json());
 const PROXY_KEY = process.env.PROXY_KEY || "";
 const AHREFS_MCP_KEY = process.env.AHREFS_MCP_KEY || "";
 const AHREFS_MCP_URL = process.env.AHREFS_MCP_URL || "https://api.ahrefs.com/mcp/mcp";
-const BUILD_VERSION = "2026-01-17-01";
+const BUILD_VERSION = "2026-01-17-02";
 
 // ---------------- AUTH ----------------
 function requireProxyKey(req, res) {
@@ -21,39 +21,36 @@ function requireProxyKey(req, res) {
 }
 
 // ---------------- YOUR PACKAGE RULES ----------------
-function recommendPackageFromRD(rd) {
-  // USER RULES:
+function recommendPackageFromRD(rdLive) {
+  // PACKAGE RECOMMENDATION (Base on Referring Domains - LIVE)
   // 0-10 = 5 links
   // 10-20 = 10 links
   // 30-80 = 15 links
   // 80-120 = 20 links
   // 120-200 = 25 links
-  // 200+ = at least 25 links, offer up to 50 links
-  //
-  // NOTE: your rules skip 20-30. We'll treat 20-29 as 10 links (closest lower bracket),
-  // and 21-29 is still closer to the "10 links" tier than "15 links".
-  if (rd <= 10) return { min: 5, max: 5, tier: "5 links" };
-  if (rd <= 20) return { min: 10, max: 10, tier: "10 links" };
-  if (rd < 30) return { min: 10, max: 10, tier: "10 links" };
-  if (rd <= 80) return { min: 15, max: 15, tier: "15 links" };
-  if (rd <= 120) return { min: 20, max: 20, tier: "20 links" };
-  if (rd <= 200) return { min: 25, max: 25, tier: "25 links" };
+  // 200+ = at least 25 links then offer upto 50 links.
+
+  if (rdLive <= 10) return { min: 5, max: 5, tier: "5 links" };
+  if (rdLive <= 20) return { min: 10, max: 10, tier: "10 links" };
+  if (rdLive < 30) return { min: 10, max: 10, tier: "10 links" }; // your gap 20-30
+  if (rdLive <= 80) return { min: 15, max: 15, tier: "15 links" };
+  if (rdLive <= 120) return { min: 20, max: 20, tier: "20 links" };
+  if (rdLive <= 200) return { min: 25, max: 25, tier: "25 links" };
   return { min: 25, max: 50, tier: "25–50 links" };
 }
 
-function dripfeedIfOversizedOrder(rd, clientRequestedLinks) {
-  // USER RULE: If client wants large amount despite low RD, allow but dripfeed 1 link every 2 days.
-  // We'll define "low RD" as <= 20 OR clientRequested > recommended max
-  if (!clientRequestedLinks) return null;
+function dripfeedIfOversizedOrder(rdLive, clientRequestedLinks) {
+  // If client wants large amount despite low RD, allow but dripfeed 1 link every 2 days.
+  if (!clientRequestedLinks) return { enabled: false };
 
-  const rec = recommendPackageFromRD(rd);
+  const rec = recommendPackageFromRD(rdLive);
   const oversized = Number(clientRequestedLinks) > Number(rec.max);
 
-  if (rd <= 20 && oversized) {
+  if (rdLive <= 20 && oversized) {
     return {
       enabled: true,
       rate: "1 link every 2 days",
-      reason: "Low RD footprint; slower velocity reduces risk while allowing larger order."
+      reason: "Low RD footprint; slower velocity reduces risk while allowing larger order.",
     };
   }
 
@@ -61,7 +58,7 @@ function dripfeedIfOversizedOrder(rd, clientRequestedLinks) {
     return {
       enabled: true,
       rate: "1 link every 2 days",
-      reason: "Requested links exceed recommended range; dripfeed reduces velocity risk."
+      reason: "Requested links exceed recommended range; dripfeed reduces velocity risk.",
     };
   }
 
@@ -70,20 +67,16 @@ function dripfeedIfOversizedOrder(rd, clientRequestedLinks) {
 
 // ---------------- URL SCOPE RESOLUTION (OBJECTIVE) ----------------
 function resolveTargetAndScope(input) {
-  // Accept: domain, hostname, or full URL
-  // Objective rule:
-  // - homepage => subdomains (domain-wide including www)
-  // - innerpage => exact URL
+  // Rule:
+  // - homepage => subdomains scope
+  // - innerpage => exact URL scope
   const raw = (input || "").trim();
-
-  // If user passes "example.com" without protocol, add https:// for parsing only
   const forParse = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `https://${raw}`;
 
   let u;
   try {
     u = new URL(forParse);
   } catch {
-    // fallback: treat as hostname
     const hostname = raw.replace(/\/+$/g, "");
     return {
       ok: true,
@@ -92,7 +85,8 @@ function resolveTargetAndScope(input) {
       mode: "subdomains",
       target_used: hostname,
       fullUrl: `https://${hostname}/`,
-      hostname
+      hostname,
+      isHomepage: true,
     };
   }
 
@@ -106,14 +100,13 @@ function resolveTargetAndScope(input) {
       input_target: raw,
       resolved_scope: "homepage(subdomains)",
       mode: "subdomains",
-      target_used: hostname,              // IMPORTANT: domain only
+      target_used: hostname,
       fullUrl: `https://${hostname}/`,
-      hostname
+      hostname,
+      isHomepage: true,
     };
   }
 
-  // Inner page: exact URL
-  // Normalize: remove trailing slash ONLY for inner pages
   u.hash = "";
   const normalized = u.toString().replace(/\/+$/g, "");
   return {
@@ -121,9 +114,10 @@ function resolveTargetAndScope(input) {
     input_target: raw,
     resolved_scope: "innerpage(exact)",
     mode: "exact",
-    target_used: normalized,              // IMPORTANT: full URL
+    target_used: normalized,
     fullUrl: normalized,
-    hostname
+    hostname,
+    isHomepage: false,
   };
 }
 
@@ -137,37 +131,20 @@ async function withAhrefsMcp(fn) {
     "X-API-Key": AHREFS_MCP_KEY,
   };
 
-  const transport = new StreamableHTTPClientTransport(
-    new URL(AHREFS_MCP_URL),
-    { requestInit: { headers } }
-  );
+  const transport = new StreamableHTTPClientTransport(new URL(AHREFS_MCP_URL), {
+    requestInit: { headers },
+  });
 
-  const client = new Client(
-    { name: "ahrefs-mcp-bridge", version: "1.0.0" },
-    { capabilities: {} }
-  );
+  const client = new Client({ name: "ahrefs-mcp-bridge", version: "1.0.0" }, { capabilities: {} });
 
   await client.connect(transport);
   try {
     return await fn(client);
   } finally {
-    try { await client.close(); } catch (_) {}
+    try {
+      await client.close();
+    } catch (_) {}
   }
-}
-
-// ---------------- RD EXTRACTION ----------------
-function tryExtractRD(parsed) {
-  // We want "Referring Domains" like Ahrefs UI count (page/domain scope dependent).
-  // Try common field names that Ahrefs tools may return.
-  return (
-    parsed?.refdomains ??
-    parsed?.referring_domains ??
-    parsed?.metrics?.refdomains ??
-    parsed?.metrics?.referring_domains ??
-    parsed?.stats?.refdomains ??
-    parsed?.stats?.referring_domains ??
-    null
-  );
 }
 
 function parseFirstJsonTextBlock(mcpResult) {
@@ -176,9 +153,7 @@ function parseFirstJsonTextBlock(mcpResult) {
     if (b?.type === "text" && typeof b.text === "string") {
       try {
         return JSON.parse(b.text);
-      } catch {
-        // ignore
-      }
+      } catch {}
     }
   }
   return null;
@@ -189,23 +164,6 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, service: "ahrefs-mcp-bridge", version: BUILD_VERSION });
 });
 
-app.get("/debug-tools", async (req, res) => {
-  if (!requireProxyKey(req, res)) return;
-
-  try {
-    const out = await withAhrefsMcp(async (client) => client.listTools());
-    res.json({ ok: true, mcp_url: AHREFS_MCP_URL, tools: out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: "Failed to list tools", message: String(e?.message || e) });
-  }
-});
-
-/**
- * GET /recommend-links?target=<url_or_domain>&client_links=<optional number>
- * Uses the objective rule:
- * - homepage -> mode=subdomains, target_used=hostname
- * - innerpage -> mode=exact, target_used=full URL
- */
 app.get("/recommend-links", async (req, res) => {
   if (!requireProxyKey(req, res)) return;
 
@@ -215,75 +173,75 @@ app.get("/recommend-links", async (req, res) => {
   if (!target) return res.status(400).json({ ok: false, error: "Missing required query param: target" });
 
   const resolved = resolveTargetAndScope(target);
-  if (!resolved.ok) return res.status(400).json({ ok: false, error: "Invalid target" });
-
-  // Ahrefs MCP tools often require a date argument.
   const date = new Date().toISOString().slice(0, 10);
 
   try {
     const result = await withAhrefsMcp(async (client) => {
-      // 1) Use backlinks-stats FIRST (best chance to match UI counts)
-      let usedTool = "site-explorer-backlinks-stats";
-      let r1;
-      try {
-        r1 = await client.callTool({
-          name: "site-explorer-backlinks-stats",
-          arguments: {
-            target: resolved.target_used,
-            mode: resolved.mode,
-            date
-          }
-        });
-      } catch (err) {
-        // If "exact" mode isn't accepted by this tool, return the error clearly (do NOT silently switch scope)
+      const tool = "site-explorer-backlinks-stats";
+
+      const r = await client.callTool({
+        name: tool,
+        arguments: {
+          target: resolved.target_used,
+          mode: resolved.mode,
+          date,
+        },
+      });
+
+      const parsed = parseFirstJsonTextBlock(r);
+
+      // ✅ THIS IS THE FIX:
+      // Ahrefs returns RD as metrics.live_refdomains / metrics.all_time_refdomains
+      const liveRD = parsed?.metrics?.live_refdomains;
+      const allTimeRD = parsed?.metrics?.all_time_refdomains;
+
+      if (liveRD === undefined || liveRD === null) {
         return {
           ok: false,
-          error: "Ahrefs tool call failed for backlinks-stats with the enforced scope rule.",
+          error: "live_refdomains not returned by Ahrefs backlinks-stats.",
           enforced_rule: resolved.resolved_scope,
           target_used: resolved.target_used,
           mode_used: resolved.mode,
           date_used: date,
-          tool: usedTool,
-          message: String(err?.message || err)
+          tool,
+          raw_json: parsed ?? null,
         };
       }
 
-      const parsed1 = parseFirstJsonTextBlock(r1);
-      const rd1 = tryExtractRD(parsed1);
+      const rdLive = Number(liveRD);
+      const rdAllTime = allTimeRD == null ? null : Number(allTimeRD);
 
-      if (rd1 === null || rd1 === undefined || Number.isNaN(Number(rd1))) {
-        // Fail hard instead of returning wrong numbers from unrelated fields.
+      if (Number.isNaN(rdLive)) {
         return {
           ok: false,
-          error: "Referring Domains not found in backlinks-stats response (no refdomains/referring_domains fields).",
-          enforced_rule: resolved.resolved_scope,
-          target_used: resolved.target_used,
-          mode_used: resolved.mode,
-          date_used: date,
-          tool: usedTool,
-          raw_json: parsed1 ?? null
+          error: "live_refdomains returned but is not numeric.",
+          raw_json: parsed ?? null,
         };
       }
 
-      const rd = Number(rd1);
-      const rec = recommendPackageFromRD(rd);
-      const dripfeed = dripfeedIfOversizedOrder(rd, clientLinks);
+      const rec = recommendPackageFromRD(rdLive);
+      const dripfeed = dripfeedIfOversizedOrder(rdLive, clientLinks);
 
       return {
         ok: true,
         input_target: resolved.input_target,
+
+        // ✅ Proof we followed your rule:
         resolved_scope: resolved.resolved_scope,
-        target_used: resolved.target_used,
         mode_used: resolved.mode,
-        date_used: date,
+        target_used: resolved.target_used,
 
-        referring_domains: rd,
+        // ✅ The numbers you care about:
+        referring_domains_live: rdLive,
+        referring_domains_all_time: rdAllTime,
 
+        // ✅ Recommendation uses LIVE RD:
         recommended_backlinks_min: rec.min,
         recommended_backlinks_max: rec.max,
         package_tier: rec.tier,
 
-        dripfeed: dripfeed,
+        dripfeed,
+        date_used: date,
       };
     });
 
